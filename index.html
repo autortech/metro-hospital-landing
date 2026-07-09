@@ -66,7 +66,7 @@
       if (s.stream) s.stream.getTracks().forEach(t => t.stop());
       if (s.ws) {
         try {
-          if (s.ws.readyState === 1) s.ws.send(JSON.stringify({ event: 'stop', streamSid: s.sid }));
+          if (s.ws.readyState === 1) s.ws.send(JSON.stringify({ event: 'stop' }));
           s.ws.close();
         } catch(e) {}
       }
@@ -93,15 +93,12 @@
         ws.onopen = function() {
           console.log('[LQ] connected');
           ws.send(JSON.stringify({
-            event: 'start', sequenceNumber: '1', streamSid: sid,
+            event: 'start',
             start: {
-              streamSid: sid,
-              accountSid: 'ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-              callSid: 'CAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-              tracks: ['inbound'],
-              mediaFormat: { encoding: 'audio/pcm', sampleRate: 24000, channels: 1 },
               customParameters: { agentId: AGENT_ID },
+              metadata: {}
             },
+            streamSid: crypto.randomUUID()
           }));
 
           const silentGain = ctx.createGain();
@@ -123,7 +120,7 @@
             const bytes = new Uint8Array(ab);
             let bin = '';
             for (let j = 0; j < bytes.length; j++) bin += String.fromCharCode(bytes[j]);
-            ws.send(JSON.stringify({ event: 'media', streamSid: sid, media: { payload: btoa(bin) } }));
+            ws.send(JSON.stringify({ event: 'media', media: { payload: btoa(bin) } }));
           };
           micSrc.connect(proc);
           proc.connect(silentGain);
@@ -144,7 +141,7 @@
                 interrupted = true;
                 srcs.forEach(function(s) { try { s.stop(); } catch(e) {} });
                 srcs.length = 0; playTime.v = 0; aiSpeaking = false;
-                if (ws.readyState === 1) ws.send(JSON.stringify({ event: 'client_interrupt', streamSid: sid }));
+                if (ws.readyState === 1) ws.send(JSON.stringify({ event: 'client_interrupt' }));
               }
             } else { speechStart = null; interrupted = false; }
           }, 50);
