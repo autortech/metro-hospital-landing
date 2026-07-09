@@ -17,6 +17,203 @@
       This page requires JavaScript to display.
     </div>
   </noscript>
+
+  <script>
+  /* Loquent voice integration — runs before bundler, window survives DOM replacement */
+  (function() {
+    const AGENT_ID = '4e6b97ce-20af-44c0-8b38-8629fb4f4583';
+    const sessions = {};
+    const attached = new WeakSet();
+
+    function iconPhone() {
+      return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.9.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/></svg>';
+    }
+    function iconDots() {
+      return '<span style="display:flex;gap:4px;align-items:center"><span style="width:6px;height:6px;border-radius:50%;background:#fff;animation:dotpulse 1.2s infinite ease-in-out"></span><span style="width:6px;height:6px;border-radius:50%;background:#fff;animation:dotpulse 1.2s infinite ease-in-out .2s"></span><span style="width:6px;height:6px;border-radius:50%;background:#fff;animation:dotpulse 1.2s infinite ease-in-out .4s"></span></span>';
+    }
+    function iconBars() {
+      return '<span style="display:flex;gap:3px;align-items:center;height:18px"><span style="width:3px;height:16px;border-radius:2px;background:#fff;animation:eqbar .7s infinite ease-in-out"></span><span style="width:3px;height:16px;border-radius:2px;background:#fff;animation:eqbar .7s infinite ease-in-out .15s"></span><span style="width:3px;height:16px;border-radius:2px;background:#fff;animation:eqbar .7s infinite ease-in-out .3s"></span><span style="width:3px;height:16px;border-radius:2px;background:#fff;animation:eqbar .7s infinite ease-in-out .45s"></span></span>';
+    }
+
+    function getAgentName(btn) {
+      const card = btn.closest('.aicard');
+      if (!card) return 'Agent';
+      const p = card.querySelector('p');
+      const m = p && p.textContent.match(/from (\w+)/);
+      return m ? m[1] : 'Agent';
+    }
+
+    function setBtn(btn, state) {
+      const name = getAgentName(btn);
+      if (state === 'idle') {
+        btn.style.background = '#b01e28';
+        btn.innerHTML = iconPhone() + ' Talk to ' + name;
+      } else if (state === 'connecting') {
+        btn.style.background = '#7d141b';
+        btn.innerHTML = iconDots() + ' Connecting';
+      } else if (state === 'active') {
+        btn.style.background = '#1a1a1a';
+        btn.innerHTML = iconBars() + ' End call';
+      }
+    }
+
+    function stopCall(btn) {
+      const id = btn._lqId;
+      const s = sessions[id];
+      if (!s) return;
+      if (s.vadTimer) clearInterval(s.vadTimer);
+      if (s.proc) { try { s.proc.disconnect(); } catch(e) {} }
+      if (s.stream) s.stream.getTracks().forEach(t => t.stop());
+      if (s.ws) {
+        try {
+          if (s.ws.readyState === 1) s.ws.send(JSON.stringify({ event: 'stop', streamSid: s.sid }));
+          s.ws.close();
+        } catch(e) {}
+      }
+      if (s.ctx) { try { s.ctx.close(); } catch(e) {} }
+      delete sessions[id];
+      setBtn(btn, 'idle');
+    }
+
+    async function startCall(btn) {
+      const id = btn._lqId;
+      setBtn(btn, 'connecting');
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        const ctx = new AudioContext({ sampleRate: 24000 });
+        await ctx.resume();
+        const sid = 'stream_' + Math.random().toString(36).substring(2, 15);
+        const playTime = { v: 0 };
+        const srcs = [];
+        let aiSpeaking = false, speechStart = null, interrupted = false;
+        const ws = new WebSocket('wss://api.getloquent.com/ws/widget?agentId=' + AGENT_ID);
+        const session = { ws, stream, ctx, sid, playTime, srcs };
+        sessions[id] = session;
+
+        ws.onopen = function() {
+          console.log('[LQ] connected');
+          ws.send(JSON.stringify({
+            event: 'start', sequenceNumber: '1', streamSid: sid,
+            start: {
+              streamSid: sid,
+              accountSid: 'ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+              callSid: 'CAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+              tracks: ['inbound'],
+              mediaFormat: { encoding: 'audio/pcm', sampleRate: 24000, channels: 1 },
+              customParameters: { agentId: AGENT_ID },
+            },
+          }));
+
+          const silentGain = ctx.createGain();
+          silentGain.gain.value = 0;
+          silentGain.connect(ctx.destination);
+
+          const micSrc = ctx.createMediaStreamSource(stream);
+          const proc = ctx.createScriptProcessor(4096, 1, 1);
+          session.proc = proc;
+          proc.onaudioprocess = function(e) {
+            if (ws.readyState !== 1) return;
+            const f32 = e.inputBuffer.getChannelData(0);
+            const ab = new ArrayBuffer(f32.length * 2);
+            const dv = new DataView(ab);
+            for (let j = 0; j < f32.length; j++) {
+              const s = Math.max(-1, Math.min(1, f32[j]));
+              dv.setInt16(j * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+            }
+            const bytes = new Uint8Array(ab);
+            let bin = '';
+            for (let j = 0; j < bytes.length; j++) bin += String.fromCharCode(bytes[j]);
+            ws.send(JSON.stringify({ event: 'media', streamSid: sid, media: { payload: btoa(bin) } }));
+          };
+          micSrc.connect(proc);
+          proc.connect(silentGain);
+
+          const vadSrc = ctx.createMediaStreamSource(stream);
+          const anl = ctx.createAnalyser();
+          anl.fftSize = 512; anl.smoothingTimeConstant = 0.3;
+          vadSrc.connect(anl);
+          const vadBuf = new Float32Array(anl.fftSize);
+          session.vadTimer = setInterval(function() {
+            anl.getFloatTimeDomainData(vadBuf);
+            let sum = 0;
+            for (let j = 0; j < vadBuf.length; j++) sum += vadBuf[j] * vadBuf[j];
+            const rms = Math.sqrt(sum / vadBuf.length);
+            if (rms > 0.05) {
+              if (!speechStart) speechStart = Date.now();
+              if (Date.now() - speechStart > 200 && aiSpeaking && !interrupted) {
+                interrupted = true;
+                srcs.forEach(function(s) { try { s.stop(); } catch(e) {} });
+                srcs.length = 0; playTime.v = 0; aiSpeaking = false;
+                if (ws.readyState === 1) ws.send(JSON.stringify({ event: 'client_interrupt', streamSid: sid }));
+              }
+            } else { speechStart = null; interrupted = false; }
+          }, 50);
+
+          setBtn(btn, 'active');
+        };
+
+        ws.onmessage = function(e) {
+          console.log('[LQ] msg:', e.data.substring(0, 80));
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg.event === 'media' && msg.media && msg.media.payload) {
+              const bin = atob(msg.media.payload);
+              const bytes = new Uint8Array(bin.length);
+              for (let j = 0; j < bin.length; j++) bytes[j] = bin.charCodeAt(j);
+              const i16 = new Int16Array(bytes.buffer);
+              const f32 = new Float32Array(i16.length);
+              for (let j = 0; j < i16.length; j++) f32[j] = i16[j] / 32768;
+              const buf = ctx.createBuffer(1, f32.length, 24000);
+              buf.getChannelData(0).set(f32);
+              const src = ctx.createBufferSource();
+              src.buffer = buf; src.connect(ctx.destination);
+              const now = ctx.currentTime;
+              const t = Math.max(now + 0.01, playTime.v);
+              src.start(t); playTime.v = t + buf.duration;
+              aiSpeaking = true; srcs.push(src);
+              src.onended = function() {
+                const i = srcs.indexOf(src);
+                if (i > -1) srcs.splice(i, 1);
+                if (!srcs.length) aiSpeaking = false;
+              };
+            } else if (msg.event === 'clear') {
+              srcs.forEach(function(s) { try { s.stop(); } catch(e) {} });
+              srcs.length = 0; playTime.v = 0; aiSpeaking = false;
+            }
+          } catch(err) {}
+        };
+
+        ws.onerror = function(err) { console.error('[LQ] error', err); stopCall(btn); };
+        ws.onclose = function() { if (sessions[id]) stopCall(btn); };
+
+      } catch(err) {
+        console.error('[LQ] start error:', err);
+        delete sessions[id];
+        setBtn(btn, 'idle');
+      }
+    }
+
+    function attachBtn(btn, idx) {
+      if (attached.has(btn)) return;
+      attached.add(btn);
+      btn._lqId = 'lq' + idx;
+      btn.addEventListener('click', function(e) {
+        e.stopImmediatePropagation();
+        if (sessions[btn._lqId]) stopCall(btn);
+        else startCall(btn);
+      }, true);
+      console.log('[LQ] attached btn', idx);
+    }
+
+    var pollCount = 0;
+    var poll = setInterval(function() {
+      var btns = document.querySelectorAll('.aibtn');
+      btns.forEach(attachBtn);
+      pollCount++;
+      if (btns.length >= 2 || pollCount > 100) clearInterval(poll);
+    }, 300);
+  })();
+  </script>
 </head>
 <body>
   <div id="__bundler_thumbnail"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="#b01e28"></rect><g fill="#fff"><rect x="44" y="30" width="12" height="40" rx="2"></rect><rect x="30" y="44" width="40" height="12" rx="2"></rect></g></svg></div>
